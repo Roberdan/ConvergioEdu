@@ -13,6 +13,10 @@ export type {
   ToolDefinition,
 } from './types';
 
+// Streaming types and function
+export type { StreamChunk, StreamChunkType, StreamingOptions } from './azure-streaming';
+export { azureStreamingCompletion } from './azure-streaming';
+
 // Configuration functions
 export {
   isAzureConfigured,

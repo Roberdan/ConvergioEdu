@@ -22,6 +22,11 @@ import {
   createErrorMessage,
 } from './message-handler';
 import {
+  isStreamingAvailable,
+  sendStreamingMessage,
+  messageRequiresTool,
+} from './streaming-handler';
+import {
   requestTool,
   createInitialToolState,
   createErrorToolState,
@@ -42,6 +47,12 @@ export function useCharacterChat(
   const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [activeTool, setActiveTool] = useState<ToolState | null>(null);
+
+  // Streaming state
+  const [streamingEnabled, setStreamingEnabled] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamedContent, setStreamedContent] = useState('');
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const hasAttemptedConnection = useRef(false);
@@ -88,6 +99,16 @@ export function useCharacterChat(
         setConfigError(error);
       } else if (info) {
         setConnectionInfo(info);
+      }
+    });
+  }, []);
+
+  // Check streaming availability
+  useEffect(() => {
+    isStreamingAvailable().then((available) => {
+      setStreamingEnabled(available);
+      if (available) {
+        logger.debug('[CharacterChat] Streaming enabled');
       }
     });
   }, []);
@@ -179,6 +200,7 @@ export function useCharacterChat(
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
     setIsLoading(true);
+    setStreamedContent('');
 
     if (conversationIdRef.current) {
       addMessageToStore(conversationIdRef.current, {
@@ -187,6 +209,80 @@ export function useCharacterChat(
       });
     }
 
+    // Try streaming if enabled AND message doesn't require tools
+    // Tool requests must go through non-streaming endpoint for tool support
+    const needsTool = messageRequiresTool(userMessage.content);
+    if (streamingEnabled && !needsTool) {
+      const abortController = new AbortController();
+      streamAbortRef.current = abortController;
+      setIsStreaming(true);
+
+      // Create placeholder message for streaming content
+      const streamingMsgId = `streaming-${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        { id: streamingMsgId, role: 'assistant', content: '', timestamp: new Date() },
+      ]);
+
+      const streamed = await sendStreamingMessage({
+        input: userMessage.content,
+        messages,
+        character,
+        characterId,
+        signal: abortController.signal,
+        onChunk: (_chunk, accumulated) => {
+          setStreamedContent(accumulated);
+          // Update the streaming message in place
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamingMsgId ? { ...m, content: accumulated } : m
+            )
+          );
+        },
+        onComplete: (fullResponse) => {
+          setIsStreaming(false);
+          streamAbortRef.current = null;
+
+          // Finalize the message
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamingMsgId
+                ? { ...m, id: `assistant-${Date.now()}`, content: fullResponse }
+                : m
+            )
+          );
+
+          if (conversationIdRef.current) {
+            addMessageToStore(conversationIdRef.current, {
+              role: 'assistant',
+              content: fullResponse,
+            });
+          }
+
+          setIsLoading(false);
+        },
+        onError: (error) => {
+          logger.error('Streaming error', { error });
+          setIsStreaming(false);
+          streamAbortRef.current = null;
+          // Remove the placeholder and show error
+          setMessages((prev) => [
+            ...prev.filter((m) => m.id !== streamingMsgId),
+            createErrorMessage(),
+          ]);
+          setIsLoading(false);
+        },
+      });
+
+      // If streaming was used (returned true), we're done
+      if (streamed) return;
+
+      // Otherwise fall through to non-streaming
+      setIsStreaming(false);
+      setMessages((prev) => prev.filter((m) => m.id !== streamingMsgId));
+    }
+
+    // Non-streaming fallback
     try {
       const { responseContent, toolState } = await sendChatMessage(
         userMessage.content,
@@ -214,7 +310,7 @@ export function useCharacterChat(
     } finally {
       setIsLoading(false);
     }
-  }, [input, isLoading, messages, character, characterId, addMessageToStore]);
+  }, [input, isLoading, messages, character, characterId, addMessageToStore, streamingEnabled]);
 
   // Handle tool request
   const handleToolRequest = useCallback(
@@ -260,6 +356,16 @@ export function useCharacterChat(
     setIsVoiceActive((prev) => !prev);
   }, [isVoiceActive, disconnect]);
 
+  // Cancel stream handler
+  const cancelStream = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+      setIsStreaming(false);
+      setIsLoading(false);
+    }
+  }, []);
+
   return {
     messages,
     input,
@@ -275,5 +381,10 @@ export function useCharacterChat(
     handleSend,
     handleToolRequest,
     handleVoiceCall,
+    // Streaming state
+    isStreaming,
+    streamingEnabled,
+    streamedContent,
+    cancelStream,
   };
 }
